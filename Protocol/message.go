@@ -3,26 +3,33 @@ package protocol
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
 	"io"
+	"os"
 )
-
-// Todo: Change this location
-type FileInfo struct {
-	Name        string
-	Type        string
-	Checksum    [20]byte
-	PieceLength int32
-	Pieces      string
-	FileLength  int32
-}
 
 // Defines the messaging format for peer to peer communication
 type MessageCode int8
 
 const (
-	MessageFileInfo MessageCode = iota + 1
+	MessagePing MessageCode = iota - 2
+	MessagePong
+	MessageRequestMetadata
+	MessageMetadata
+	MessageSenderRelayHandshake
+	MessageSenderAcknowledgement
+	MessageListenerRelayHandshake
+	MessageListenerAcknowledgement
+	MessageRequestPiece
+	MessagePiece
+	MessagePieceAcknowledgement
 )
+
+type PieceBlock struct {
+	Index         int32
+	Offset        int32
+	NumTransfered int32
+	Buf           []byte
+}
 
 type Message struct {
 	ID MessageCode
@@ -75,8 +82,37 @@ func DeserializeMessage(message []byte) (*Message, error) {
 	}, nil
 }
 
-func FormatInfo(file FileInfo) (*Message, error) {
-	message := Message{ID: MessageFileInfo}
+func DeserializeMessageFromReader(buf io.Reader) (*Message, error) {
+
+	//Fetch Size
+	size := make([]byte, 4)
+	_, err := io.ReadFull(buf, size)
+	if err != nil {
+		return nil, err
+	}
+
+	msgLength := int32(binary.BigEndian.Uint32(size))
+
+	//Keep alive message
+	if msgLength == 0 {
+		return nil, nil
+	}
+
+	payload := make([]byte, msgLength)
+	_, err = io.ReadFull(buf, payload)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Message{
+		ID:      MessageCode(payload[0]),
+		Payload: payload[1:],
+	}, nil
+}
+
+// Marshall Metadata into message format
+func MarshallMetadata(file *Metadata) (*Message, error) {
+	message := Message{ID: MessageMetadata}
 
 	var buf bytes.Buffer
 
@@ -105,12 +141,19 @@ func FormatInfo(file FileInfo) (*Message, error) {
 		return nil, err
 	}
 
-	err = writeString(&buf, file.Pieces)
+	err = binary.Write(&buf, binary.BigEndian, uint32(len(file.Pieces)))
 	if err != nil {
 		return nil, err
 	}
 
-	err = binary.Write(&buf, binary.BigEndian, uint32(file.FileLength))
+	for i := range len(file.Pieces) {
+		err = binary.Write(&buf, binary.BigEndian, file.Pieces[i])
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	err = binary.Write(&buf, binary.BigEndian, uint64(file.FileLength))
 	if err != nil {
 		return nil, err
 	}
@@ -120,7 +163,7 @@ func FormatInfo(file FileInfo) (*Message, error) {
 	return &message, nil
 }
 
-func ParseInfo(message Message) (*FileInfo, error) {
+func UnmarshallMetadata(message *Message) (*Metadata, error) {
 	buf := bytes.NewReader(message.Payload)
 	var length uint32
 
@@ -173,26 +216,100 @@ func ParseInfo(message Message) (*FileInfo, error) {
 		return nil, err
 	}
 
-	pieces := make([]byte, length)
-	if _, err := buf.Read(pieces); err != nil {
-		return nil, err
+	pieces := make([][20]byte, length)
+	for i := range length {
+		var piece [20]byte
+
+		if _, err := buf.Read(piece[:]); err != nil {
+			return nil, err
+		}
+
+		copy(pieces[i][:], piece[:])
 	}
 
 	//Extract Piecelength
-	var fileLength int32
+	var fileLength int64
 	err = binary.Read(buf, binary.BigEndian, &fileLength)
 	if err != nil {
 		return nil, err
 	}
 
-	return &FileInfo{
+	return &Metadata{
 		Name:        string(name),
 		Type:        string(mimetype),
 		Checksum:    checksumArr,
 		PieceLength: pieceLength,
-		Pieces:      string(pieces),
+		Pieces:      pieces,
 		FileLength:  fileLength,
 	}, nil
+}
+
+func MarshallPiece(file *os.File, index int) (*Message, error) {
+	//Create a buf
+	buf := make([]byte, PIECELENGTH)
+
+	offset := index * PIECELENGTH
+
+	n, err := file.ReadAt(buf, int64(offset))
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+
+	message := Message{ID: MessagePiece}
+
+	//<index><offset><transfered data length><data>
+	var payload bytes.Buffer
+	err = binary.Write(&payload, binary.BigEndian, uint32(index))
+	if err != nil {
+		return nil, err
+	}
+
+	err = binary.Write(&payload, binary.BigEndian, uint32(offset))
+	if err != nil {
+		return nil, err
+	}
+
+	err = binary.Write(&payload, binary.BigEndian, uint32(n))
+	if err != nil {
+		return nil, err
+	}
+
+	message.Payload = append(payload.Bytes(), buf[:n]...)
+	return &message, nil
+}
+
+func UnmarshallPiece(message *Message) (*PieceBlock, error) {
+	msg := bytes.NewReader(message.Payload)
+	var piece PieceBlock
+	err := binary.Read(msg, binary.BigEndian, &piece.Index)
+	if err != nil {
+		return nil, err
+	}
+
+	err = binary.Read(msg, binary.BigEndian, &piece.Offset)
+	if err != nil {
+		return nil, err
+	}
+
+	err = binary.Read(msg, binary.BigEndian, &piece.NumTransfered)
+	if err != nil {
+		return nil, err
+	}
+
+	piece.Buf = message.Payload[12:]
+
+	return &piece, nil
+}
+
+func RequestPiece(index int) []byte {
+	msg := Message{ID: MessageRequestPiece}
+
+	payload := make([]byte, 4)
+	binary.BigEndian.PutUint32(payload[0:4], uint32(index))
+
+	msg.Payload = payload
+
+	return msg.Serialize()
 }
 
 func writeString(buf *bytes.Buffer, s string) error {
@@ -202,11 +319,10 @@ func writeString(buf *bytes.Buffer, s string) error {
 	if err != nil {
 		return err
 	}
-	n, err := buf.Write(b)
+	_, err = buf.Write(b)
 	if err != nil {
 		return err
 	}
 
-	fmt.Println("num", n)
 	return nil
 }
