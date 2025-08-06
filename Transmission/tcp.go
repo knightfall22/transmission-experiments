@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -74,6 +75,8 @@ type Peer struct {
 
 	MulticastAddress string
 
+	DownloadFilePath string
+
 	//When a new listener joins it's incremented.
 	// When a listener completes it decrements. When == 0, notifies the sender to close the file
 	ToCommplete int
@@ -91,6 +94,7 @@ type Options struct {
 	MaxPieceRetries  int
 	ListenerLimit    int
 	MulticastAddress string
+	DownloadFilePath string
 }
 
 // Idea change from method to function and allow options struct
@@ -144,7 +148,7 @@ func (p *Peer) Start() error {
 	return nil
 }
 
-func (p *Peer) Listen(opts Options) (buf []byte, err error) {
+func (p *Peer) Listen(opts Options) (err error) {
 	//Idea: accept relay from peer discovery or option
 	p.State = receiver
 
@@ -163,7 +167,7 @@ func (p *Peer) Listen(opts Options) (buf []byte, err error) {
 			ipv4Discoveries, err1 := peerdiscovery.Discover(peerdiscovery.Settings{
 				Limit:            1,
 				Payload:          []byte("ok"),
-				TimeLimit:        200 * time.Millisecond,
+				TimeLimit:        500 * time.Millisecond,
 				Delay:            20 * time.Millisecond,
 				MulticastAddress: p.MulticastAddress,
 			})
@@ -183,7 +187,7 @@ func (p *Peer) Listen(opts Options) (buf []byte, err error) {
 			ipv4Discoveries, err1 := peerdiscovery.Discover(peerdiscovery.Settings{
 				Limit:            1,
 				Payload:          []byte("ok"),
-				TimeLimit:        200 * time.Millisecond,
+				TimeLimit:        500 * time.Millisecond,
 				Delay:            20 * time.Millisecond,
 				MulticastAddress: p.MulticastAddress,
 				IPVersion:        peerdiscovery.IPv6,
@@ -200,7 +204,7 @@ func (p *Peer) Listen(opts Options) (buf []byte, err error) {
 		wg.Wait()
 
 		if err != nil {
-			return nil, err
+			return err
 		}
 
 		wasDiscovered := false
@@ -222,9 +226,7 @@ func (p *Peer) Listen(opts Options) (buf []byte, err error) {
 
 				address := net.JoinHostPort(discovered.Address, port)
 				err := utils.PingServer(address)
-				if err != nil {
-					return nil, err
-				} else {
+				if err == nil {
 					p.SenderAddress = address
 					wasDiscovered = true
 					break
@@ -233,7 +235,7 @@ func (p *Peer) Listen(opts Options) (buf []byte, err error) {
 		}
 
 		if !wasDiscovered {
-			return nil, fmt.Errorf("no peers found")
+			return fmt.Errorf("no peers found")
 		}
 	} else {
 		p.SenderAddress = opts.SenderAddress
@@ -244,25 +246,43 @@ func (p *Peer) Listen(opts Options) (buf []byte, err error) {
 
 	conn, err := p.connectToSender()
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	if err := p.listenerRelayHandshake(conn); err != nil {
 		p.dlog("an error occurred sending relay handshake: %v\n", err)
 		conn.Close()
-		return nil, err
+		return err
 	}
 
 	if err := p.listenerRequestMetadata(conn); err != nil {
 		p.dlog("an error occurred requesting metadata: %v\n", err)
 		conn.Close()
-		return nil, err
+		return err
 	}
 
-	//Begin receiving file
+	//Create file from metadata information
+	if opts.DownloadFilePath == "" {
+		opts.DownloadFilePath = "./"
+	}
+
+	// Ensure the download directory exists
+	if err := os.MkdirAll(opts.DownloadFilePath, 0755); err != nil {
+		return err
+	}
+
+	p.DownloadFilePath = filepath.Join(opts.DownloadFilePath, p.Metadata.Name)
+
+	file, err := os.OpenFile(p.DownloadFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	p.OpenFile = file
+
 	workers := make(chan pieceWorker, len(p.Metadata.Pieces))
 	result := make(chan protocol.PieceBlock)
-
 	errChan := make(chan error, 1)
 
 	for idx, piece := range p.Metadata.Pieces {
@@ -273,24 +293,46 @@ func (p *Peer) Listen(opts Options) (buf []byte, err error) {
 		p.download(workers, conn, result, errChan)
 	}()
 
-	buf = make([]byte, p.Metadata.FileLength)
+	buf := make([]byte, 0, FLUSH_TRIGGER)
 	done := 0
 
 	for done < len(p.Metadata.Pieces) {
-		var res protocol.PieceBlock
 		select {
-		case res = <-result:
+		case res := <-result:
+			// Append piece data to rolling buffer
+			buf = append(buf, res.Buf...)
+
+			// Flush when buffer is full
+			if len(buf) >= FLUSH_TRIGGER {
+				if _, err := p.OpenFile.Write(buf); err != nil {
+					return err
+				}
+				if err := p.OpenFile.Sync(); err != nil {
+					return err
+				}
+				buf = buf[:0]
+			}
+
 		case err := <-errChan:
-			return nil, err
+			return err
 		}
-		begin, end := p.calculateBoundsForPiece(int(res.Index))
-		copy(buf[begin:end], res.Buf)
 		done++
 	}
 
-	conn.Close()
+	// Final flush if buffer has leftover data
+	if len(buf) > 0 {
+		n := len(buf) - 1
+		if _, err := p.OpenFile.Write(buf[:n]); err != nil {
+			return err
+		}
+		if err := p.OpenFile.Sync(); err != nil {
+			return err
+		}
+	}
+
 	close(workers)
-	return buf, nil
+	conn.Close()
+	return nil
 }
 
 func (p *Peer) connectToSender() (net.Conn, error) {
@@ -393,8 +435,6 @@ func (p *Peer) run(host string) {
 	p.selfConn = l
 	p.mu.Unlock()
 
-	fmt.Println("hello")
-
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
@@ -445,6 +485,7 @@ func (p *Peer) run(host string) {
 }
 
 func (p *Peer) broadcastOnLocalNetwork(useipv6 bool) {
+	p.dlog("broadcasting on local network")
 	// look for peers first
 	settings := peerdiscovery.Settings{
 		Limit:     -1,

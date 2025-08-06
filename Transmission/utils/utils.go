@@ -34,7 +34,7 @@ func PingServer(address string) error {
 		return err
 	}
 
-	msg := protocol.Message{ID: protocol.MessagePiece}
+	msg := protocol.Message{ID: protocol.MessagePing}
 	_, err = c.Write(msg.Serialize())
 	if err != nil {
 		log.Println(err)
@@ -48,6 +48,7 @@ func PingServer(address string) error {
 	}
 
 	if m.ID == protocol.MessagePong {
+		c.Close()
 		return nil
 	}
 
