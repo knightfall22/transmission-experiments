@@ -6,6 +6,7 @@ import (
 	"crypto/sha1"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -19,6 +20,8 @@ import (
 	"github.com/schollz/peerdiscovery"
 )
 
+var Debug = 1
+
 type PeerState int8
 
 func (p PeerState) String() string {
@@ -29,6 +32,8 @@ func (p PeerState) String() string {
 		return "receiver"
 	case relay:
 		return "relay"
+	case dead:
+		return "dead"
 
 	}
 	return ""
@@ -38,6 +43,7 @@ const (
 	sender PeerState = iota + 1
 	receiver
 	relay
+	dead
 )
 
 type pieceWorker struct {
@@ -51,7 +57,7 @@ type Peer struct {
 	Port    int
 	portStr string
 
-	mu sync.Mutex
+	mu sync.RWMutex
 
 	//Idea might need to be `net.IP`
 	ExtenalIP string
@@ -77,6 +83,10 @@ type Peer struct {
 
 	DownloadFilePath string
 
+	//Time is seconds that determines how long the server will idle(no listener present) before it closes.
+	//Default == 3 minutes
+	AutomaticShutdownDelay time.Duration
+
 	//When a new listener joins it's incremented.
 	// When a listener completes it decrements. When == 0, notifies the sender to close the file
 	ToCommplete int
@@ -89,22 +99,45 @@ type Peer struct {
 }
 
 type Options struct {
-	SenderAddress    string
-	FilePath         string
-	MaxPieceRetries  int
-	ListenerLimit    int
-	MulticastAddress string
-	DownloadFilePath string
+	SenderAddress          string
+	FilePath               string
+	MaxPieceRetries        int
+	ListenerLimit          int
+	MulticastAddress       string
+	DownloadFilePath       string
+	AutomaticShutdownDelay time.Duration
 }
 
-// Idea change from method to function and allow options struct
-// Create a sender peer, start a relay connect sender peer to relay
-func (p *Peer) Send(opts Options) error {
+func (p *Peer) Send() {
+
+	p.dlog("starting sender server")
+
+	go p.run(LOCAL_DEFAULT_ADDRESS)
+	go p.broadcastOnLocalNetwork(false)
+	go p.broadcastOnLocalNetwork(true)
+
+	time.Sleep(500 * time.Millisecond)
+}
+
+func (p *Peer) Start(opts Options) error {
+	id, err := generatePeerID(sender)
+	if err != nil {
+		return err
+	}
+
+	p.id = id
+
 	if p.Port == 0 {
 		//Fetch available port
 		p.Port = utils.GetFirstOpenPort(LOCAL_DEFAULT_ADDRESS, DEFAULT_PORT)
 		p.portStr = fmt.Sprint(p.Port)
 	}
+
+	if opts.AutomaticShutdownDelay == 0 {
+		opts.AutomaticShutdownDelay = 3 * time.Minute
+	}
+
+	p.AutomaticShutdownDelay = opts.AutomaticShutdownDelay
 
 	//Generate metadata from file
 	meta, err := protocol.GenerateMetadata(opts.FilePath)
@@ -116,11 +149,12 @@ func (p *Peer) Send(opts Options) error {
 	p.MulticastAddress = opts.MulticastAddress
 
 	if opts.ListenerLimit == 0 {
-		p.ListenerLimit = 4
+		opts.ListenerLimit = 4
 	}
 
+	p.ListenerLimit = opts.ListenerLimit
+
 	//Open file
-	//Todo: Proper file close logic
 	file, err := os.Open(opts.FilePath)
 	if err != nil {
 		return err
@@ -128,28 +162,13 @@ func (p *Peer) Send(opts Options) error {
 
 	p.OpenFile = file
 
-	p.dlog("starting sender server")
+	p.shutdown = make(chan struct{})
 
-	go p.run(LOCAL_DEFAULT_ADDRESS)
-	go p.broadcastOnLocalNetwork(false)
-	go p.broadcastOnLocalNetwork(true)
-
-	time.Sleep(500 * time.Millisecond)
-	return nil
-}
-
-func (p *Peer) Start() error {
-	id, err := generatePeerID(p.State)
-	if err != nil {
-		return err
-	}
-
-	fmt.Println(id)
+	p.Send()
 	return nil
 }
 
 func (p *Peer) Listen(opts Options) (err error) {
-	//Idea: accept relay from peer discovery or option
 	p.State = receiver
 
 	if opts.SenderAddress == "" {
@@ -249,8 +268,8 @@ func (p *Peer) Listen(opts Options) (err error) {
 		return err
 	}
 
-	if err := p.listenerRelayHandshake(conn); err != nil {
-		p.dlog("an error occurred sending relay handshake: %v\n", err)
+	if err := p.listenerSenderHandshake(conn); err != nil {
+		p.dlog("an error occurred sending sender handshake: %v\n", err)
 		conn.Close()
 		return err
 	}
@@ -273,7 +292,7 @@ func (p *Peer) Listen(opts Options) (err error) {
 
 	p.DownloadFilePath = filepath.Join(opts.DownloadFilePath, p.Metadata.Name)
 
-	file, err := os.OpenFile(p.DownloadFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	file, err := os.OpenFile(p.DownloadFilePath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
 	if err != nil {
 		return err
 	}
@@ -312,17 +331,19 @@ func (p *Peer) Listen(opts Options) (err error) {
 				}
 				buf = buf[:0]
 			}
-
 		case err := <-errChan:
 			return err
 		}
 		done++
+
+		percent := float64(done) / float64(len(p.Metadata.Pieces)) * 100
+		log.Printf("(%0.2f%%)", percent)
+
 	}
 
 	// Final flush if buffer has leftover data
 	if len(buf) > 0 {
-		n := len(buf) - 1
-		if _, err := p.OpenFile.Write(buf[:n]); err != nil {
+		if _, err := p.OpenFile.Write(buf); err != nil {
 			return err
 		}
 		if err := p.OpenFile.Sync(); err != nil {
@@ -330,9 +351,37 @@ func (p *Peer) Listen(opts Options) (err error) {
 		}
 	}
 
+	//Get checksum and verify file
+	hasher := sha1.New()
+
+	_, err = p.OpenFile.Seek(0, 0)
+	if err != nil {
+		return err
+	}
+
+	_, err = io.Copy(hasher, p.OpenFile)
+	if err != nil {
+		return err
+	}
+
+	fileCheckSum := hasher.Sum(nil)
+
+	if !bytes.Equal(fileCheckSum, p.Metadata.Checksum[:]) {
+		p.dlog("downloaded file does not match checksum possible corruption detected")
+		return fmt.Errorf("checksum does not match")
+	}
+
 	close(workers)
 	conn.Close()
 	return nil
+}
+
+func (p *Peer) Shutdown() {
+	close(p.shutdown)
+	p.selfConn.Close()
+	p.wg.Wait()
+	p.State = dead
+
 }
 
 func (p *Peer) connectToSender() (net.Conn, error) {
@@ -435,6 +484,8 @@ func (p *Peer) run(host string) {
 	p.selfConn = l
 	p.mu.Unlock()
 
+	go p.autoShutdown()
+
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
@@ -444,6 +495,7 @@ func (p *Peer) run(host string) {
 				select {
 				case <-p.shutdown:
 					p.dlog("closing server")
+					p.OpenFile.Close()
 					return
 				default:
 					p.dlog(err.Error())
@@ -467,12 +519,16 @@ func (p *Peer) run(host string) {
 					}
 					p.mu.Unlock()
 
+					p.mu.RLock()
 					p.dlog("listener %s disconnected, remaining listeners: %d", conn.RemoteAddr(), len(p.Listeners))
+					p.mu.RUnlock()
 				}()
 
 				for {
 					p.dlog("waiting for message from %s", conn.RemoteAddr())
+					p.mu.RLock()
 					p.dlog("listener length: %d", len(p.Listeners))
+					p.mu.RUnlock()
 					if err := p.messageProcessor(conn); err != nil {
 						p.dlog("listener %s error or EOF: %v", conn.RemoteAddr(), err)
 						return
@@ -482,6 +538,28 @@ func (p *Peer) run(host string) {
 
 		}
 	}()
+}
+
+func (p *Peer) autoShutdown() {
+	timer := time.NewTimer(p.AutomaticShutdownDelay)
+
+	for {
+		<-timer.C
+
+		p.mu.RLock()
+		if len(p.Listeners) == 0 {
+			p.mu.RUnlock()
+
+			p.dlog("server idled for too long, shutting down....")
+			timer.Stop()
+			p.Shutdown()
+			return
+		} else {
+			timer.Reset(p.AutomaticShutdownDelay)
+		}
+		p.mu.RUnlock()
+	}
+
 }
 
 func (p *Peer) broadcastOnLocalNetwork(useipv6 bool) {
@@ -535,16 +613,16 @@ func (p *Peer) broadcastOnLocalNetwork(useipv6 bool) {
 // 	}
 // }
 
-// Read an acknowledgement message from the relay
-func (p *Peer) listenerRelayHandshake(conn net.Conn) error {
-	p.dlog("perform listener relay handshake message")
+// Read an acknowledgement message from the sender
+func (p *Peer) listenerSenderHandshake(conn net.Conn) error {
+	p.dlog("perform listener sender handshake message")
 	if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
 		return err
 	}
 
 	defer conn.SetReadDeadline(time.Time{})
 
-	_, err := conn.Write(listenerRelayHandshake())
+	_, err := conn.Write(listenerSenderHandshake())
 	if err != nil {
 		return err
 	}
@@ -558,12 +636,12 @@ func (p *Peer) listenerRelayHandshake(conn net.Conn) error {
 		p.Sender = conn
 		return nil
 	} else {
-		p.dlog("panicing relay acknowledgment not received")
-		panic("supposed to receive relay acknowledgement")
+		p.dlog("panicing sender acknowledgment not received")
+		panic("supposed to receive sender acknowledgement")
 	}
 }
 
-// Read file metadata from relay
+// Read file metadata from sender
 func (p *Peer) listenerRequestMetadata(conn net.Conn) error {
 	p.dlog("perform request metadata handshake")
 	if err := conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
@@ -589,12 +667,12 @@ func (p *Peer) listenerRequestMetadata(conn net.Conn) error {
 			return err
 		}
 
-		p.dlog("received metadata from relay")
+		p.dlog("received metadata from sender")
 		p.mu.Unlock()
 		return nil
 	} else {
-		p.dlog("panicing relay acknowledgment not received")
-		panic("supposed to receive relay acknowledgement")
+		p.dlog("panicing sender acknowledgment not received")
+		panic("supposed to receive sender acknowledgement")
 	}
 }
 
@@ -605,32 +683,35 @@ func (p *Peer) messageProcessor(conn net.Conn) error {
 	}
 
 	switch msg.ID {
-	case protocol.MessageSenderRelayHandshake:
-		p.dlog("sender detected")
-		p.mu.Lock()
-		if p.Sender != nil {
-			p.dlog("sender already exists, this shouldn't happen")
-		}
-		_, err := conn.Write(senderRelayAck())
-		if err != nil {
-			p.mu.Unlock()
-			return err
-		}
-		p.Sender = conn
-		p.mu.Unlock()
+	// case protocol.MessageSenderRelayHandshake:
+	// 	p.dlog("sender detected")
+	// 	p.mu.Lock()
+	// 	if p.Sender != nil {
+	// 		p.dlog("sender already exists, this shouldn't happen")
+	// 	}
+	// 	_, err := conn.Write(senderRelayAck())
+	// 	if err != nil {
+	// 		p.mu.Unlock()
+	// 		return err
+	// 	}
+	// 	p.Sender = conn
+	// 	p.mu.Unlock()
 
-	case protocol.MessageListenerRelayHandshake:
-		p.mu.Lock()
+	case protocol.MessageListenerSenderHandshake:
 		p.dlog("listener detected")
+
+		p.mu.RLock()
 		if len(p.Listeners) != p.ListenerLimit {
+			p.mu.RUnlock()
+
 			_, err := conn.Write(senderListenerAck())
 			if err != nil {
-				p.mu.Unlock()
 				return err
 			}
+			p.mu.Lock()
 			p.Listeners = append(p.Listeners, conn)
+			p.mu.Unlock()
 		}
-		p.mu.Unlock()
 
 	case protocol.MessagePing:
 		_, err := conn.Write(sendPong())
@@ -639,6 +720,7 @@ func (p *Peer) messageProcessor(conn net.Conn) error {
 		}
 
 	case protocol.MessageRequestMetadata:
+		p.dlog("%s has requested metadata", conn.RemoteAddr().String())
 		msg, err := protocol.MarshallMetadata(p.Metadata)
 		if err != nil {
 			return err
@@ -662,7 +744,7 @@ func (p *Peer) messageProcessor(conn net.Conn) error {
 			return err
 		}
 
-		p.dlog("sent piece %d to relay: %s", idx, conn.RemoteAddr().String())
+		p.dlog("sent piece %d to listener: %s", idx, conn.RemoteAddr().String())
 	}
 	return nil
 }
@@ -693,8 +775,10 @@ func (p *Peer) verifyPiece(piece *protocol.PieceBlock) bool {
 
 // dlog logs a debugging message if DebugCM > 0.
 func (p *Peer) dlog(format string, args ...any) {
-	format = fmt.Sprintf("[%s] ", p.id) + format
-	log.Printf(format, args...)
+	if Debug > 0 {
+		format = fmt.Sprintf("[%s] ", p.id) + format
+		log.Printf(format, args...)
+	}
 
 }
 
@@ -716,8 +800,8 @@ func senderRelayHandshake() []byte {
 	return msg.Serialize()
 }
 
-func listenerRelayHandshake() []byte {
-	msg := protocol.Message{ID: protocol.MessageListenerRelayHandshake}
+func listenerSenderHandshake() []byte {
+	msg := protocol.Message{ID: protocol.MessageListenerSenderHandshake}
 	return msg.Serialize()
 }
 

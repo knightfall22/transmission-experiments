@@ -1,102 +1,131 @@
 package transmission
 
 import (
-	"fmt"
 	"net"
 	"testing"
 	"time"
 )
 
-// "9208"
-func TestStart(t *testing.T) {
-	var p Peer
-	p.State = sender
-	p.id, _ = generatePeerID(sender)
-	err := p.Send(Options{FilePath: "C:/Users/Elite Gamer/Downloads/Video/Batman- The Court of Owls Full Story Motion Comic.mp4"})
-	fmt.Println(err)
-	var l Peer
+func TestStartAndListen(t *testing.T) {
+	// Debug = 0
+	p := new(Peer)
+	err := p.Start(Options{FilePath: "../test_assets/TCP-IP.pdf"})
+	if err != nil {
+		t.Fatalf("an error as occurred while starting up send %v\n", err)
+	}
+
+	l := new(Peer)
 
 	senderAddress := net.JoinHostPort(LOCAL_DEFAULT_ADDRESS, p.portStr)
+	err = l.Listen(Options{
+		SenderAddress:    senderAddress,
+		MaxPieceRetries:  4,
+		DownloadFilePath: "./download_test",
+	})
+
+	if err != nil {
+		t.Fatalf("an error as occurred while listening %v\n", err)
+	}
+}
+
+func TestStartAndListenConcurrent(t *testing.T) {
+	p := new(Peer)
+	err := p.Start(Options{FilePath: "../test_assets/TCP-IP.pdf"})
+	if err != nil {
+		t.Fatalf("an error as occurred while starting up send %v\n", err)
+	}
+
+	errChan := make(chan error, 2)
+	senderAddress := net.JoinHostPort(LOCAL_DEFAULT_ADDRESS, p.portStr)
+
 	go func() {
-		err := l.Listen(Options{SenderAddress: senderAddress, MaxPieceRetries: 4, DownloadFilePath: "./download_test"})
-		fmt.Println("err", err)
+		l := new(Peer)
+		errChan <- l.Listen(Options{
+			SenderAddress:    senderAddress,
+			MaxPieceRetries:  4,
+			DownloadFilePath: "./download_test",
+		})
+
 	}()
 
-	// go func() {
-	// 	var l2 Peer
-	// 	err := l2.Listen(Options{SenderAddress: senderAddress, MaxPieceRetries: 4})
-	// 	fmt.Println("err", err)
-	// }()
+	go func() {
+		l := new(Peer)
+		errChan <- l.Listen(Options{
+			SenderAddress:    senderAddress,
+			MaxPieceRetries:  4,
+			DownloadFilePath: "./download_test",
+		})
 
-	time.Sleep(500000 * time.Millisecond)
-	fmt.Println(err)
-	fmt.Printf("file length: %d\n", p.Metadata.FileLength)
-	// os.WriteFile("./g.pdf", buf, 0666)
+	}()
 
-	fmt.Println(p.Metadata.Checksum)
-}
-
-func TestStart2(t *testing.T) {
-	// var p Peer
-	// p.State = sender
-	// p.id, _ = generatePeerID(sender)
-	// err := p.Send(Options{FilePath: "../test_assets/TCP-IP.pdf"})
-	// fmt.Println(err)
-
-	var l Peer
-
-	err := l.Listen(Options{MaxPieceRetries: 4})
-	fmt.Println("err", err)
-
-	time.Sleep(20 * time.Minute)
-
-	// go func() {
-	// 	var l2 Peer
-	// 	buf, err := l2.Listen(Options{SenderAddress: senderAddress, MaxPieceRetries: 4})
-	// 	fmt.Println("err", err)
-	// 	fmt.Println(sha1.Sum(buf))
-	// }()
-
-	// go func() {
-	// 	var l3 Peer
-	// 	buf, err := l3.Listen(Options{SenderAddress: senderAddress, MaxPieceRetries: 4})
-	// 	fmt.Println("err", err)
-	// 	fmt.Println(sha1.Sum(buf))
-	// }()
-
-	// time.Sleep(500 * time.Millisecond)
-	// fmt.Println(err)
-	// fmt.Printf("file length: %d\n", p.Metadata.FileLength)
-	// // os.WriteFile("./g.pdf", buf, 0666)
-
-	// fmt.Println(p.Metadata.Checksum)
-}
-
-func TestListenerClose(t *testing.T) {
-	var p Peer
-	p.State = sender
-	p.id, _ = generatePeerID(sender)
-	err := p.Send(Options{FilePath: "../test_assets/TCP-IP.pdf"})
-	if err != nil {
-		t.Fatalf("an error has occurred: %v\n", err)
+	time.Sleep(500 * time.Millisecond)
+	for range 2 {
+		e := <-errChan
+		if e != nil {
+			t.Fatalf("an error as occurred while listening %v\n", err)
+		}
 	}
+
+	p.Shutdown()
+}
+
+func TestStartAndListenConcurrentDefaultMax(t *testing.T) {
+	p := new(Peer)
+	err := p.Start(Options{FilePath: "../test_assets/TCP-IP.pdf"})
+	if err != nil {
+		t.Fatalf("an error as occurred while starting up send %v\n", err)
+	}
+
+	errChan := make(chan error, p.ListenerLimit)
+	senderAddress := net.JoinHostPort(LOCAL_DEFAULT_ADDRESS, p.portStr)
+
+	for range p.ListenerLimit {
+		go func() {
+			l := new(Peer)
+			errChan <- l.Listen(Options{
+				SenderAddress:    senderAddress,
+				MaxPieceRetries:  4,
+				DownloadFilePath: "./download_test",
+			})
+
+		}()
+	}
+
+	time.Sleep(500 * time.Millisecond)
+	for range p.ListenerLimit {
+		e := <-errChan
+		if e != nil {
+			t.Fatalf("an error as occurred while listening %v\n", err)
+		}
+	}
+
+	p.Shutdown()
+}
+
+func TestListenerAutoShutdown(t *testing.T) {
+	p := new(Peer)
+	err := p.Start(Options{FilePath: "../test_assets/TCP-IP.pdf", AutomaticShutdownDelay: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("an error as occurred while starting up send %v\n", err)
+	}
+
+	l := new(Peer)
 
 	senderAddress := net.JoinHostPort(LOCAL_DEFAULT_ADDRESS, p.portStr)
-	var l Peer
-	l.SenderAddress = senderAddress
-	l.id, _ = generatePeerID(receiver)
+	err = l.Listen(Options{
+		SenderAddress:    senderAddress,
+		MaxPieceRetries:  4,
+		DownloadFilePath: "./download_test",
+	})
 
-	conn, err := l.connectToSender()
 	if err != nil {
-		t.Fatalf("an error has occurred: %v\n", err)
+		t.Fatalf("an error as occurred while listening %v\n", err)
 	}
 
-	err = l.listenerRelayHandshake(conn)
-	if err != nil {
-		t.Fatalf("an error has occurred: %v\n", err)
-	}
+	time.Sleep(5 * time.Second)
 
-	conn.Close()
-	time.Sleep(1 * time.Second)
+	if p.State != dead {
+		t.Fatalf("expected %s but got %s", dead, p.State)
+	}
 
 }
