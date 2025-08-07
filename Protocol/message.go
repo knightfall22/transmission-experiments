@@ -17,7 +17,7 @@ const (
 	MessageMetadata
 	MessageSenderRelayHandshake
 	MessageSenderAcknowledgement
-	MessageListenerRelayHandshake
+	MessageListenerSenderHandshake
 	MessageListenerAcknowledgement
 	MessageRequestPiece
 	MessagePiece
